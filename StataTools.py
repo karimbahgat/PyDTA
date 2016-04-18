@@ -1,4 +1,5 @@
-from struct import unpack, calcsize
+
+from struct import unpack, calcsize, Struct
 
 from StataTypes import MissingValue, Variable
 
@@ -134,6 +135,13 @@ class Reader(object):
         self._has_string_data = len(filter(lambda x: type(x) is int, self._header['typlist'])) > 0
         self._col_size()
 
+        # create rowunpacker
+        typlist = self._header['typlist']
+        frmtlist = [t if type(t)!=int else bytes(t)+"s" for t in typlist]
+        frmt = "".join(frmtlist)
+        frmt = self._header['byteorder'] + frmt
+        self._rowstruct = Struct(frmt)
+
     def _calcsize(self, fmt):
         return type(fmt) is int and fmt or calcsize(self._header['byteorder']+fmt)
 
@@ -158,14 +166,46 @@ class Reader(object):
         return d
 
     def _next(self):
-        typlist = self._header['typlist']
-        if self._has_string_data:
-            data = [None]*self._header['nvar']
-            for i in range(len(data)):
-                if type(typlist[i]) is int:
-                    data[i] = self._null_terminate(self._file.read(typlist[i]))
-                else:
-                    data[i] = self._unpack(typlist[i], self._file.read(self._col_size(i)))
-            return data
-        else:
-            return map(lambda i: self._unpack(typlist[i], self._file.read(self._col_size(i))), range(self._header['nvar']))
+        # what about nullterminate on strings?
+        row = self._rowstruct.unpack(self._file.read(self._rowstruct.size))
+
+        # turn missing values into MissingValue or None
+        # TODO: This step alone can increase speed from 1 sec to 26 sec.
+        # so possible with some optimization...
+        typlist = self._header["typlist"]
+        valtyps = zip(row,typlist)
+        def missingfilter():
+            if self._missing_values:
+                for val,typ in valtyps:
+                    if typ in self.MISSING_VALUES:
+                        nmin, nmax = self.MISSING_VALUES[typ]
+                        if not nmin <= val <= nmax:
+                            yield MissingValue(nmax, val) # only difference
+                        else:
+                            yield val
+                    else:
+                        yield val
+            else:
+                for val,typ in valtyps:
+                    if typ in self.MISSING_VALUES:
+                        nmin, nmax = self.MISSING_VALUES[typ]
+                        if not nmin <= val <= nmax:
+                            yield None # only difference
+                        else:
+                            yield val
+                    else:
+                        yield val
+        row = list(missingfilter())
+        
+        return row
+        
+##        if self._has_string_data:
+##            data = [None]*self._header['nvar']
+##            for i in range(len(data)):
+##                if type(typlist[i]) is int:
+##                    data[i] = self._null_terminate(self._file.read(typlist[i]))
+##                else:
+##                    data[i] = self._unpack(typlist[i], self._file.read(self._col_size(i)))
+##            return data
+##        else:
+##            return map(lambda i: self._unpack(typlist[i], self._file.read(self._col_size(i))), range(self._header['nvar']))
