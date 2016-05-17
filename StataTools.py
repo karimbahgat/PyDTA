@@ -41,6 +41,9 @@ class Reader(object):
         """Returns the date and time Stata recorded on last file save."""
         return self._header['time_stamp']
 
+    def value_labels(self):
+        return self._header["vallabs"]
+
     def variables(self):
         """Returns a list of the dataset's PyDTA.Variables."""
         return map(Variable, zip(range(self._header['nvar']),
@@ -141,6 +144,206 @@ class Reader(object):
         frmt = "".join(frmtlist)
         frmt = self._header['byteorder'] + frmt
         self._rowstruct = Struct(frmt)
+
+        # offset to value labels
+        byteoffset = self._rowstruct.size * self._header["nobs"]
+        self._file.seek(byteoffset, 1)
+
+        ###############################
+        # value labels
+        # taken straight from stata_dta...
+        class MissingValue():
+            """A class to mimic some of the properties of Stata's missing values.
+            
+            The class is intended for mimicking only the 27 regular missing
+            values ., .a, .b, .c, etc.
+            
+            Users wanting MissingValue instances should access members of
+            MISSING_VALS rather than create new instances.
+            
+            """
+            def __init__(self, index):
+                """Users wanting MissingValue instances should access members of
+                MISSING_VALS rather than create new instances.
+                
+                """
+                self.value = float.fromhex(
+                    "".join(('0x1.0', hex(index)[2:].zfill(2), 'p+1023'))
+                )
+                self.name = "." if index == 0 else "." + chr(index + 96)
+                self.index = index
+                    
+            def __abs__(self):
+                return self
+                
+            def __add__(self, other):
+                return MISSING
+                
+            def __bool__(self):
+                return True
+                
+            def __divmod__(self, other):
+                return MISSING, MISSING
+                
+            def __eq__(self, other):
+                other_val = other.value if isinstance(other, MissingValue) else other
+                return self.value == other_val
+                
+            def __floordiv__(self, other):
+                return MISSING
+                
+            def __ge__(self, other):
+                other_val = other.value if isinstance(other, MissingValue) else other
+                return self.value >= other_val
+                
+            def __gt__(self, other):
+                other_val = other.value if isinstance(other, MissingValue) else other
+                return self.value > other_val
+                
+            def __hash__(self):
+                return self.value.__hash__()
+                
+            def __le__(self, other):
+                other_val = other.value if isinstance(other, MissingValue) else other
+                return self.value <= other_val
+                
+            def __lt__(self, other):
+                other_val = other.value if isinstance(other, MissingValue) else other
+                return self.value < other_val
+                
+            def __mod__(self, other):
+                return MISSING
+                
+            def __mul__(self, other):
+                return MISSING
+                
+            def __ne__(self, other):
+                other_val = other.value if isinstance(other, MissingValue) else other
+                return self.value != other_val
+                
+            def __neg__(self):
+                return MISSING
+                
+            def __pos__(self):
+                return MISSING
+                
+            def __pow__(self, other):
+                return MISSING
+                
+            def __radd__(self, other):
+                return MISSING
+                
+            def __rdivmod__(self, other):
+                return MISSING, MISSING
+                
+            def __repr__(self):
+                return self.name
+                
+            def __rfloordiv__(self, other):
+                return MISSING
+                
+            def __rmod__(self, other):
+                return MISSING
+                
+            def __rmul__(self, other):
+                return MISSING
+                
+            def __round__(self, ndigits=None):
+                return self
+                
+            def __rpow__(self, other):
+                return MISSING
+                
+            def __rsub__(self, other):
+                return MISSING
+                
+            def __rtruediv__(self, other):
+                return MISSING
+                
+            def __sub__(self, other):
+                return MISSING
+                
+            def __str__(self):
+                return self.name
+                
+            def __truediv__(self, other):
+                return MISSING
+
+
+        MISSING_VALS = tuple(MissingValue(i) for i in range(27))
+        
+        missing_above = {251: 100, 252: 32740, 253: 2147483620, 
+                        254: float.fromhex('0x1.fffffep+126'), 
+                        255: float.fromhex('0x1.fffffffffffffp+1022')}
+        # decimal numbers given in -help dta- for float and double 
+        # are approximations: 'f': 1.701e38, 'd': 8.988e307
+        type_dict = {251: ['b',1], 252: ['h',2], 253: ['l',4], 
+                    254: ['f',4], 255: ['d',8]}
+                    
+        def get_byte_str(str_len):
+            s = unpack(str(str_len) + 's', self._file.read(str_len))[0]
+            return s.partition(b'\0')[0].decode('iso-8859-1')
+            
+        def missing_object(miss_val, st_type):
+            if st_type == 251: # byte
+                value = MISSING_VALS[miss_val - 101]
+            elif st_type == 252: # int
+                value = MISSING_VALS[miss_val - 32741]
+            elif st_type == 253: # long
+                value = MISSING_VALS[miss_val - 2147483621]
+            elif st_type == 254: # float
+                value = MISSING_VALS[int(miss_val.hex()[5:7], 16)]
+            elif st_type == 255: # double
+                value = MISSING_VALS[int(miss_val.hex()[5:7], 16)]
+            return value
+            
+        def get_var_val(st_type):
+            if st_type <= 244:
+                return get_byte_str(st_type)
+            else:
+                fmt, nbytes = type_dict[st_type]
+                val = unpack(byteorder+fmt, self._file.read(nbytes))[0]
+                return (val if val <= missing_above[st_type] 
+                        else missing_object(val, st_type))
+
+        def parse_value_label_table():
+            """helper function for reading dta files"""
+            
+            nentries = unpack(byteorder + 'l', self._file.read(4))[0]
+            txtlen = unpack(byteorder + 'l', self._file.read(4))[0]
+            off = []
+            val = []
+            txt = []
+            for i in range(nentries):
+                off.append(unpack(byteorder+'l',self._file.read(4))[0])
+            for i in range(nentries):
+                val.append(unpack(byteorder+'l',self._file.read(4))[0])
+            
+            txt_block = unpack(str(txtlen) + "s", self._file.read(txtlen))
+            txt = [t.decode('iso-8859-1') 
+                   for b in txt_block for t in b.split(b'\0')]
+            
+            # put (off, val) pairs in same order as txt
+            sorter = list(zip(off, val))
+            sorter.sort()
+            
+            # dict of val[i]:txt[i]
+            table = {sorter[i][1]: txt[i] for i in range(len(sorter))}
+            
+            return table
+        
+        value_labels = {}
+        while True:
+            try:
+                self._file.seek(4,1) # table length
+                labname = get_byte_str(33)
+                self._file.seek(3,1) # padding
+                vl_table = parse_value_label_table()
+                value_labels[labname] = vl_table
+            except:
+                break
+        self._header['vallabs'] = value_labels
+        
 
     def _calcsize(self, fmt):
         return type(fmt) is int and fmt or calcsize(self._header['byteorder']+fmt)
